@@ -179,7 +179,7 @@ static struct fb_var_screeninfo ssd1306fb_var = {
 static struct ssd1306fb_array *ssd1306fb_alloc_array(u32 len, u8 type){
 	struct ssd1306fb_array *array;
 
-	array = kzalloc(sizeof(struct ssd1306fb_array) + len * 4, GFP_KERNEL);
+	array = kzalloc(sizeof(struct ssd1306fb_array) + len, GFP_KERNEL);
 	if (!array)
 		return NULL;
 
@@ -246,11 +246,10 @@ static void ssd1306fb_update_display(struct ssd1306fb_par *par){
 		}
 	}
 
-	for(int i = 0; i < 64; i++){
-		memcpy(par->data16->data, vmem + i * 16, 16); 
-		// it does not matter that we do not use i2c_transfer, there is still 2ms delay between each message
-		// when using the ch341 usb i2c driver
-		ssd1306fb_write_array(par, par->data16, 16);
+	// display only supports one page writes at a time
+	for(int i = 0; i < par->height / 8; i++){
+		memcpy(par->data16->data, array + i * par->width, par->width); 
+		ssd1306fb_write_array(par, par->data16, par->width);
 	}
 }
 
@@ -426,7 +425,7 @@ static int ssd1306fb_probe(struct i2c_client *client,
 	par->height = 64; 
 	par->page_offset = 1; 
 	
-	par->data16 = ssd1306fb_alloc_array(64, SSD1306_DATA); 
+	par->data16 = ssd1306fb_alloc_array((par->width * par->height) / 8, SSD1306_DATA); 
 	par->cmd1 = ssd1306fb_alloc_array(1, SSD1306_COMMAND); 
 
 	//INIT_WORK(&par->work, ssd1306fb_update_task); 
