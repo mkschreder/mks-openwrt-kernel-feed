@@ -17,7 +17,27 @@
  * published by the Free Software Foundation, version 2.
  */
 
+/* 
+Notes about this driver
+
+This chips supports usb transfers of up to 32 bytes. This includes control
+bytes as well. This means we need to split all communication with the chip into
+32 byte packets. The throughput is limited to how many such packets we can send
+(my measurements indicate that there is 2ms delay between each usb packet). 
+
+Luckily, the actual i2c packet size is not limited because we are indeed
+allowed to send continuation packets and split larger messages into smaller
+blocks while not having to deal with the messages being split on the other end.
+
+So far tested with: 
+	- ssd1306 display
+	- 24c32 eeprom
+
+// Martin
+*/ 
+
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -55,6 +75,8 @@
 #define                CH341_PARA_CMD_W0                0xA6
 #define                CH341_PARA_CMD_W1                0xA7
 #define                CH341_PARA_CMD_STS                0xA0
+
+#define CH341A_CMD_READ_STATUS 0xF0
 
 #define                CH341A_CMD_SET_OUTPUT        0xA1
 #define                CH341A_CMD_IO_ADDR                0xA2
@@ -115,23 +137,22 @@
 #define RESP_NACK       0x07
 #define RESP_TIMEOUT        0x09
 
-#define CH341_OUTBUF_LEN    64
-#define CH341_INBUF_LEN 	64 /* can we support more bytes? */
+#define CH341A_DATA_CHUNK_SIZE 25 // chips supports max 32 bytes but we have to account for command bytes as well 
+#define CH341A_BUF_LEN    64
 
 #undef TRACE
-#define TRACE(...) printk(__VA_ARGS__)
+#define TRACE(...) {}
+//#define TRACE(...) printk(__VA_ARGS__)
 
 struct ch341_data {
-	u8 obuffer[CH341_OUTBUF_LEN]; 
-    u8 ibuffer[CH341_INBUF_LEN];    /* input buffer */
+	u8 buffer[CH341A_BUF_LEN]; 	/* temporary buffer for transaction data */ 
     int ep_in, ep_out;              /* Endpoints    */
     struct usb_device *usb_dev; /* the usb device for this device */
     struct usb_interface *interface;/* the interface for this device */
     struct i2c_adapter adapter; /* i2c related things */
-    int olen;           /* Output buffer length */
-    int ocount;         /* Number of enqueued messages */
-    int ilen;
-    int check_ack;
+	
+	// must be locked whenever we are sending data and unlocked afterwards
+	struct mutex i2c_lock; 
 };
 
 static uint frequency = U2C_I2C_FREQ_STD;   /* I2C clock frequency in Hz */
@@ -139,91 +160,198 @@ static uint frequency = U2C_I2C_FREQ_STD;   /* I2C clock frequency in Hz */
 module_param(frequency, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(frequency, "I2C clock frequency in hertz");
 
-static int ch341_usb_cmd_read_i2c(struct ch341_data *dev, u8 addr, u8 *data, u8 datalen){
-	u8 *msg0 = dev->obuffer; 
-    int msgsize = 0, ret, actual = 0;
+static int ch341_usb_cmd_poll_device(struct ch341_data *dev, u8 addr) {
+	return 1; 
+	// TOO SLOW
+	for(int c = 0; c < 10; c++){
+		u8 *msg = dev->buffer; 
+		int msgsize = 0, ret, actual; 
 
-	TRACE("ch341: issuing i2c read of %d bytes..\n", datalen); 
-	
-	if(datalen > CH341A_DATA_CHUNK_SIZE){
-		dev_err(dev->interface->dev, "ch341: data length > %d not supported!\n", CH341A_DATA_CHUNK_SIZE); 
-		datalen &= 0xf; 
+		msg[msgsize++] = CH341A_CMD_I2C_STREAM;
+		msg[msgsize++] = CH341A_CMD_I2C_STM_STA;
+		msg[msgsize++] = CH341A_CMD_I2C_STM_OUT | 0;  // NOTE: must be zero length otherwise it messes up the device
+		msg[msgsize++] = addr | 0x01; // use a read 
+		msg[msgsize++] = CH341A_CMD_I2C_STM_IN;  // zero length here as well
+		msg[msgsize++] = CH341A_CMD_I2C_STM_STO;
+		msg[msgsize++] = CH341A_CMD_I2C_STM_END;
+		
+		ret = usb_bulk_msg(dev->usb_dev,
+				   usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
+				   msg, msgsize, &actual,
+				   DEFAULT_TIMEOUT);
+
+		memset(msg, 0, sizeof(dev->buffer)); 
+		ret = usb_bulk_msg(dev->usb_dev,
+					   usb_rcvbulkpipe(dev->usb_dev, dev->ep_in),
+					   dev->buffer, CH341A_BUF_LEN, &actual,
+					   DEFAULT_TIMEOUT);
+		
+		TRACE("STATUS: fail:%d ret:%d, len:%d, buf:%02x:%02x\n", !!(msg[0] & 0x80), ret, actual, msg[0], msg[1]); 
+		if(!(msg[0] & 0x80)) return 1;  
 	}
-
-    msg0[msgsize++] = CH341A_CMD_I2C_STREAM;
-    msg0[msgsize++] = CH341A_CMD_I2C_STM_STA;
-    msg0[msgsize++] = CH341A_CMD_I2C_STM_OUT | ((datalen + 1) & 0x1f); // length + 1 address
-    msg0[msgsize++] = addr | 0x01; // i2c read
-	// TODO: figure out how this will actually work in practice on an EEPROM for instance.
-    for (int i = 0; i < datalen; i++) {
-        msg0[msgsize++] = CH341A_CMD_I2C_STM_IN | (i & 0x1f); //((datalen - i) - 1);
-    }
-
-    msg0[msgsize++] = CH341A_CMD_I2C_STM_STO;
-    msg0[msgsize++] = CH341A_CMD_I2C_STM_END;
-	
-	ret = usb_bulk_msg(dev->usb_dev,
-			   usb_rcvbulkpipe(dev->usb_dev, dev->ep_in),
-			   msg0, msgsize, &actual,
-			   DEFAULT_TIMEOUT);
-	
-	if(ret < 0) return ret; 
-	if(actual != msgsize) {
-		// TODO: when testing, figure out if we should allow this
-		dev_err(dev->interface->dev, "ch341: received less data than requested!\n"); 
-		return -EIO; 
-	}
-
-	memcpy(data, dev->ibuffer, actual); 
-
 	return 0; 
 }
 
+/* 
+* Issues a writeread through the i2c. (note: this function is currently broken)
+* locks i2c_lock 
+*/
+static int ch341_usb_cmd_read_i2c(struct ch341_data *dev, u8 addr, u8 *data, u8 datalen){
+	u8 *msg0 = dev->buffer; 
+    int ret, actual = 0;
+	int transfered = 0; 
+
+	mutex_lock(&dev->i2c_lock); 
+
+	if(ch341_usb_cmd_poll_device(dev, addr) == 0){
+		mutex_unlock(&dev->i2c_lock); 
+		return -EIO; 
+	}
+
+	TRACE("ch341: issuing i2c read of %d bytes to %02x..\n", datalen, addr >> 1); 
+
+	while(transfered < datalen) {
+		int msgsize = 0; 
+
+		/*if(datalen > CH341A_DATA_CHUNK_SIZE){
+			dev_err(&dev->interface->dev, "ch341: data length > %d not supported!\n", CH341A_DATA_CHUNK_SIZE); 
+			datalen = CH341A_DATA_CHUNK_SIZE; 
+		}*/
+		
+		int chunk_size = CH341A_DATA_CHUNK_SIZE; 
+		if(transfered != 0) chunk_size = 32 - 3; 
+		if(transfered + chunk_size >= datalen) chunk_size = datalen - transfered; 
+		
+		if(transfered == 0){
+			msg0[msgsize++] = CH341A_CMD_I2C_STREAM;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_STA;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_OUT | 1; // 1 address byte
+			msg0[msgsize++] = addr | 0x01; // i2c read
+
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_IN | (chunk_size & 0x1f);
+
+			if(transfered + chunk_size >= datalen) msg0[msgsize++] = CH341A_CMD_I2C_STM_STO;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_END;
+		} else {
+			msg0[msgsize++] = CH341A_CMD_I2C_STREAM;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_IN | (chunk_size & 0x1f);
+			if(transfered + chunk_size >= datalen) msg0[msgsize++] = CH341A_CMD_I2C_STM_STO;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_END; 
+		}
+			
+		ret = usb_bulk_msg(dev->usb_dev,
+				   usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
+				   dev->buffer, msgsize, &actual,
+				   DEFAULT_TIMEOUT);
+	
+		if(ret < 0 || actual < msgsize) goto error; 
+
+		//TRACE("ch341: sent read command: count:%d addr:%02x\n", actual, addr >> 1); 
+
+		memset(dev->buffer, 0, sizeof(dev->buffer)); 
+
+		ret = usb_bulk_msg(dev->usb_dev,
+				   usb_rcvbulkpipe(dev->usb_dev, dev->ep_in),
+				   dev->buffer, CH341A_BUF_LEN, &actual,
+				   DEFAULT_TIMEOUT);
+		
+		TRACE("ch341: read result: ret:%d, len:%d\n", ret, actual); 
+
+		if(ret < 0 || actual == 0) goto error; 
+		
+		//actual--; // first byte is status byte!
+
+		TRACE("ch341: read success: count:%d addr:%02x status:%02x data: ", actual, addr >> 1, dev->buffer[0]); 
+		for(int c = 0; c < actual; c++) TRACE("%02x ", dev->buffer[c]); 
+		TRACE("\n"); 
+		
+		memcpy(data + transfered, dev->buffer, actual); 
+
+		transfered += actual; 
+		//break; 
+	}
+
+	mutex_unlock(&dev->i2c_lock); 
+	return datalen; 
+error: 
+	if(ret < 0) dev_err(&dev->interface->dev, "ch341: could not read device: %d\n", ret); 
+	mutex_unlock(&dev->i2c_lock); 
+	return -EIO; 
+}
+
 static int ch341_usb_cmd_write_i2c(struct ch341_data *dev, u8 addr, u8 *data, u8 datalen){
-    int transfered = 0;
+	int ret;
+	int transfered = 0; 
+    u8 *msg0 = dev->buffer; 
 
-	// split data into chunks of at most 32 bytes
+	mutex_lock(&dev->i2c_lock); 
+
+	if(ch341_usb_cmd_poll_device(dev, addr) == 0){
+		mutex_unlock(&dev->i2c_lock); 
+		return -EIO; 
+	}
+
 	while(transfered < datalen){
-		int chunk_size = 24; // this is the maximum data size we can send in one packet
-		int msgsize = 0, actual = 0, ret = 0; 
-    	u8 *msg0 = dev->obuffer; 
-
+		int msgsize = 0, actual = 0; 
+		int chunk_size = CH341A_DATA_CHUNK_SIZE; 
 		if(transfered + chunk_size > datalen) chunk_size = datalen - transfered; 
 
-		//TRACE("ch341: i2c write chunk size:%d, total:%d\n", chunk_size, datalen); 
+		//TRACE("ch341: issuing i2c write of %d bytes to %02x.. %02x %02x %02x\n", datalen, addr >> 1, data[0], data[1], data[2]); 
+
+		TRACE("ch341: i2c write chunk size:%d, total:%d\n", chunk_size, datalen); 
 		
 		// TODO: can this somehow handle multipart packets??
-		msg0[msgsize++] = CH341A_CMD_I2C_STREAM; 
-		msg0[msgsize++] = CH341A_CMD_I2C_STM_STA; 
+		if(transfered == 0){
+			msg0[msgsize++] = CH341A_CMD_I2C_STREAM; 
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_STA; 
 
-		msg0[msgsize++] = CH341A_CMD_I2C_STM_OUT | ((chunk_size + 1) & 0x1f); // 5 bit length of output data + 1 addr byte
-		msg0[msgsize++] = addr & 0xfe,
-		memcpy(msg0 + msgsize, data + transfered, chunk_size);
-		msgsize += chunk_size;
-		
-		msg0[msgsize++] = CH341A_CMD_I2C_STM_STO;
-		msg0[msgsize++] = CH341A_CMD_I2C_STM_END;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_OUT | ((chunk_size + 1) & 0x1f); //(((datalen > 0)?(datalen + 1):0) & 0x1f); // 5 bit length of output data + 1 addr byte
+			msg0[msgsize++] = addr & 0xfe,
+			memcpy(msg0 + msgsize, data, chunk_size);
+			msgsize += chunk_size;
+			
+			if(transfered + chunk_size >= datalen) msg0[msgsize++] = CH341A_CMD_I2C_STM_STO;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_END;
+		} else {
+			msg0[msgsize++] = CH341A_CMD_I2C_STREAM; 
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_OUT | ((chunk_size) & 0x1f); //(((datalen > 0)?(datalen + 1):0) & 0x1f); // 5 bit length of output data + 1 addr byte
+			memcpy(msg0 + msgsize, data + transfered, chunk_size);
+			msgsize += chunk_size;
+			
+			if(transfered + chunk_size >= datalen) msg0[msgsize++] = CH341A_CMD_I2C_STM_STO;
+			msg0[msgsize++] = CH341A_CMD_I2C_STM_END;
+		}
 
 		ret = usb_bulk_msg(dev->usb_dev,
 				   usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
 				   msg0, msgsize, &actual,
 				   DEFAULT_TIMEOUT);
 		
-		//TRACE("ch341: chunk sent with status %d, total bytes sent: %d\n", ret, actual); 
+		TRACE("ch341: read result: ret:%d, len:%d\n", ret, actual); 
+		if(ret < 0 || actual != msgsize) goto error; 
 
-		if(ret < 0) return ret; 
-
-		if(actual < chunk_size) {
-			dev_err(dev->interface->dev, "ch341: subsize write. Device does not work correctly!\n"); 
-			return -EIO; 
-		}
-		
-		return actual; 
-		// TODO: currently we do not support multipart writes because chipd does not have such feature documented 
-		transfered += actual; 
+		transfered += chunk_size; 
 	}
+/*
+	{
+		int read = 0; 
+		// extra read
+		int r = usb_bulk_msg(dev->usb_dev,
+				   usb_rcvbulkpipe(dev->usb_dev, dev->ep_in),
+				   msg0, CH341A_BUF_LEN, &read,
+				   100);
 
-    return 0; 
+		if(r >= 0 && read) TRACE("ch341: extra read got %d\n", read); 
+	}
+*/
+
+	mutex_unlock(&dev->i2c_lock); 
+	
+	TRACE("ch341: successfully wrote %d bytes\n", datalen); 
+	return datalen; 
+error: 
+	mutex_unlock(&dev->i2c_lock); 
+	return -EIO; 
 }
 
 static int ch341_set_speed(struct ch341_data *dev, u8 speed){
@@ -235,16 +363,21 @@ static int ch341_set_speed(struct ch341_data *dev, u8 speed){
         CH341A_CMD_I2C_STM_END
     };
 
-	memcpy(dev->obuffer, msg, 3); 
+	mutex_lock(&dev->i2c_lock); 
+
+	memcpy(dev->buffer, msg, 3); 
 
 	ret = usb_bulk_msg(dev->usb_dev,
 			   usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
-			   dev->obuffer, 3, &actual,
+			   dev->buffer, 3, &actual,
 			   DEFAULT_TIMEOUT);
 	
 	TRACE("ch341: set_speed: %d - %d\n", ret, actual); 
 
-    if(ret < 0 || actual != 3) return -EIO; 
+	mutex_unlock(&dev->i2c_lock); 
+
+    if(ret < 0 || actual != 3) ret = -EIO; 
+
 	return 0; 
 }
 
@@ -252,7 +385,6 @@ static int ch341_set_speed(struct ch341_data *dev, u8 speed){
 static int ch341_init(struct ch341_data *dev)
 {
     int speed, freq;
-    dev_info(&dev->interface->dev, "%s", __FUNCTION__);
     if (frequency >= 750000) {
         speed = CH341_I2C_HIGH_SPEED;
         freq = frequency;
@@ -286,22 +418,22 @@ static int ch341_usb_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
                           int num){
     struct ch341_data *dev = i2c_get_adapdata(adapter);
     struct i2c_msg *pmsg;
-    int i, ret;
+    int i, ret = 0;
 
     for (i = 0; i < num; i++) {
         pmsg = &msgs[i];
 
         if (pmsg->flags & I2C_M_RD) {
 			// current do not support reading!
-			dev_err(dev->interface->dev, "ch341: I2C READ CURRENTLY NOT SUPPORTED!\n"); 
-			pmsg->len = 0;  
+			//dev_err(&dev->interface->dev, "ch341: I2C READ CURRENTLY NOT SUPPORTED!\n"); 
 			// I did not test the code below but it has so far not been used
-			//ch341_usb_cmd_read_i2c(dev, pmsg->addr << 1, pmsg->buf, pmsg->len)
+			if(pmsg->flags & I2C_M_RECV_LEN) printk("RECV LEN\n"); 
+			ret = ch341_usb_cmd_read_i2c(dev, pmsg->addr << 1, pmsg->buf, pmsg->len); 
+			if(ret < 0) return ret; 
+			if(ret > 0) pmsg->len = ret; 
         } else {
             ret = ch341_usb_cmd_write_i2c(dev, pmsg->addr << 1, pmsg->buf, pmsg->len);
-            if (ret < 0) {
-         		return ret; 
-            }
+            if(ret < 0) return ret; 
         }
     }
 
@@ -338,12 +470,6 @@ static const struct usb_device_id ch341_i2c_table[] = {
 
 MODULE_DEVICE_TABLE(usb, ch341_i2c_table);
 
-static void ch341_i2c_free(struct ch341_data *dev)
-{
-    usb_put_dev(dev->usb_dev);
-    kfree(dev);
-}
-
 static int ch341_i2c_probe(struct usb_interface *interface,
                            const struct usb_device_id *id){
     struct usb_device *udev;
@@ -365,6 +491,8 @@ static int ch341_i2c_probe(struct usb_interface *interface,
         ret = -ENOMEM;
         goto error;
     }
+	mutex_init(&dev->i2c_lock); 
+
     dev->ep_out = hostif->endpoint[1].desc.bEndpointAddress;
     dev_info(&interface->dev, "ep_out=%x\n", dev->ep_out);
     dev->ep_in = hostif->endpoint[0].desc.bEndpointAddress;
@@ -430,13 +558,15 @@ static int ch341_i2c_probe(struct usb_interface *interface,
         goto error_free;
     }
 
-    dev_dbg(&interface->dev, "connected " DRIVER_NAME "\n");
+    dev_dbg(&interface->dev, "initialized " DRIVER_NAME "\n");
 
     return 0;
 
 error_free:
     usb_set_intfdata(interface, NULL);
-    ch341_i2c_free(dev);
+	usb_put_dev(dev->usb_dev);
+	mutex_destroy(&dev->i2c_lock); 
+    kfree(dev);
 error:
     return ret;
 }
@@ -446,9 +576,11 @@ static void ch341_i2c_disconnect(struct usb_interface *interface){
 
     i2c_del_adapter(&dev->adapter);
     usb_set_intfdata(interface, NULL);
-    ch341_i2c_free(dev);
+	usb_put_dev(dev->usb_dev);
+	mutex_destroy(&dev->i2c_lock); 
+    kfree(dev);
 
-    dev_dbg(&interface->dev, "disconnected\n");
+    printk(KERN_INFO "ch341: driver removed!\n");
 }
 
 static struct usb_driver ch341_i2c_driver = {
