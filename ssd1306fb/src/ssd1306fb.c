@@ -132,29 +132,22 @@
 
 struct ssd1306fb_par;
 
-struct ssd1306fb_ops {
-	int (*init)(struct ssd1306fb_par *);
-	int (*remove)(struct ssd1306fb_par *);
-};
-
 struct ssd1306fb_par {
 	struct i2c_client *client;
 	struct i2c_msg queue[8]; 
 	u8 transfer_buf[(8 * 17)]; // 8 * 16 + 8 * 1(address)
 
 	u32 height;
-	struct fb_info *info;
-	struct ssd1306fb_ops *ops;
-	u32 page_offset;
-	struct pwm_device *pwm;
-	u32 pwm_period;
 	u32 width;
+
+	struct fb_info *info;
+	u32 page_offset;
 
 	// used for temporary data storage
 	struct ssd1306fb_array *cmd1; 
 	struct ssd1306fb_array *data16;
 
-	//struct work_struct work; 
+	struct semaphore sem; 
 };
 
 struct ssd1306fb_array {
@@ -188,7 +181,7 @@ static struct ssd1306fb_array *ssd1306fb_alloc_array(u32 len, u8 type){
 	return array;
 }
 
-static int ssd1306fb_write_array(struct ssd1306fb_par *par,
+static int _ssd1306fb_write_array(struct ssd1306fb_par *par,
 				 struct ssd1306fb_array *array, u32 len){
 	int ret;
 
@@ -203,32 +196,29 @@ static int ssd1306fb_write_array(struct ssd1306fb_par *par,
 	return 0;
 }
 
-static inline int ssd1306fb_write_cmd(struct ssd1306fb_par *par, u8 cmd){
+static inline int _ssd1306fb_write_cmd(struct ssd1306fb_par *par, u8 cmd){
 	par->cmd1->data[0] = cmd;
-	return ssd1306fb_write_array(par, par->cmd1, 1);
+	return _ssd1306fb_write_array(par, par->cmd1, 1);
 }
 
-static inline int ssd1306fb_write_data(struct ssd1306fb_par *par, u8 data){
-	par->data16->data[0] = data; 
-	return ssd1306fb_write_array(par, par->data16, 1);
-}
+static void _ssd1306fb_update_display(struct ssd1306fb_par *par){
+	// this function must not lock device semaphore 
 
-static void ssd1306fb_update_display(struct ssd1306fb_par *par){
 	u8 *vmem = par->info->screen_base;
 	u8 array[1024]; 
 
 	// go to first character
-	ssd1306fb_write_cmd(par, SSD1306_SETLOWCOLUMN); 
-	ssd1306fb_write_cmd(par, SSD1306_SETHIGHCOLUMN); 
-	ssd1306fb_write_cmd(par, SSD1306_SETSTARTPAGE); 
+	_ssd1306fb_write_cmd(par, SSD1306_SETLOWCOLUMN); 
+	_ssd1306fb_write_cmd(par, SSD1306_SETHIGHCOLUMN); 
+	_ssd1306fb_write_cmd(par, SSD1306_SETSTARTPAGE); 
 
-	ssd1306fb_write_cmd(par, SSD1306_COLUMNADDR);
-	ssd1306fb_write_cmd(par, 0);   // Column start address (0 = reset)
-	ssd1306fb_write_cmd(par, 127); // Column end address (127 = reset)
+	_ssd1306fb_write_cmd(par, SSD1306_COLUMNADDR);
+	_ssd1306fb_write_cmd(par, 0);   // Column start address (0 = reset)
+	_ssd1306fb_write_cmd(par, 127); // Column end address (127 = reset)
 
-	ssd1306fb_write_cmd(par, SSD1306_PAGEADDR);
-	ssd1306fb_write_cmd(par, 0); // Page start address (0 = reset)
-	ssd1306fb_write_cmd(par, 7); // Page end address	
+	_ssd1306fb_write_cmd(par, SSD1306_PAGEADDR);
+	_ssd1306fb_write_cmd(par, 0); // Page start address (0 = reset)
+	_ssd1306fb_write_cmd(par, 7); // Page end address	
 
 	// write in chunks of 16 bytes (can not send more over i2c right now)
 	for (int i = 0; i < (par->height / 8); i++) {
@@ -249,7 +239,7 @@ static void ssd1306fb_update_display(struct ssd1306fb_par *par){
 	// display only supports one page writes at a time
 	for(int i = 0; i < par->height / 8; i++){
 		memcpy(par->data16->data, array + i * par->width, par->width); 
-		ssd1306fb_write_array(par, par->data16, par->width);
+		_ssd1306fb_write_array(par, par->data16, par->width);
 	}
 }
 
@@ -262,38 +252,47 @@ static ssize_t ssd1306fb_write(struct fb_info *info, const char __user *buf,
 	u8 __iomem *dst;
 
 	printk("ssd1306: write %d at %lu\n", count, p); 
+	
+	if(down_interruptible(&par->sem) != 0) return -ERESTARTSYS; 
 
 	total_size = info->fix.smem_len;
 
-	if (p > total_size)
-		return -EINVAL;
+	if (p > total_size){
+		up(&par->sem); 
+		return 0;
+	}
 
 	if (count + p > total_size)
 		count = total_size - p;
 
-	if (!count)
-		return -EINVAL;
+	if (!count){
+		up(&par->sem); 
+		return -ENOSPC;
+	}
 
 	dst = (void __force *) (info->screen_base + p);
 
-	if (copy_from_user(dst, buf, count))
+	if (copy_from_user(dst, buf, count)){
+		up(&par->sem); 
 		return -EFAULT;
+	}
 	
-	ssd1306fb_update_display(par); 
-	//schedule_work(&par->work); 
+	_ssd1306fb_update_display(par); 
 
 	*ppos += count;
 
+	up(&par->sem); 
 	return count;
 }
 
 static void ssd1306fb_fillrect(struct fb_info *info, const struct fb_fillrect *rect)
 {
 	struct ssd1306fb_par *par = info->par;
-	sys_fillrect(info, rect);
 	printk("ssd1306: fillrect\n"); 
-	ssd1306fb_update_display(par); 
-	//schedule_work(&par->work); 
+	sys_fillrect(info, rect);
+	if(down_interruptible(&par->sem)) return; 
+	_ssd1306fb_update_display(par); 
+	up(&par->sem); 
 }
 
 static void ssd1306fb_copyarea(struct fb_info *info, const struct fb_copyarea *area)
@@ -301,17 +300,17 @@ static void ssd1306fb_copyarea(struct fb_info *info, const struct fb_copyarea *a
 	struct ssd1306fb_par *par = info->par;
 	sys_copyarea(info, area);
 	printk("ssd1306: copyarea\n"); 
-	ssd1306fb_update_display(par); 
-	//schedule_work(&par->work); 
+	if(down_interruptible(&par->sem)) return; 
+	_ssd1306fb_update_display(par); 
+	up(&par->sem); 
 }
 
 static void ssd1306fb_imageblit(struct fb_info *info, const struct fb_image *image)
 {
 	struct ssd1306fb_par *par = info->par;
-	sys_imageblit(info, image);
 	printk("ssd1306: imageblit\n"); 
-	ssd1306fb_update_display(par); 
-	//schedule_work(&par->work); 
+	sys_imageblit(info, image);
+	_ssd1306fb_update_display(par); 
 }
 
 static struct fb_ops ssd1306fb_ops = {
@@ -322,12 +321,6 @@ static struct fb_ops ssd1306fb_ops = {
 	.fb_copyarea	= ssd1306fb_copyarea,
 	.fb_imageblit	= ssd1306fb_imageblit,
 };
-
-static void ssd1306fb_update_task(struct work_struct *work){
-	//struct ssd1306fb_par *par = container_of(work, struct ssd1306fb_par, work);  
-	//ssd1306fb_update_display(par); 
-	//schedule_work(work); 
-}
 
 static int ssd1306fb_ssd1306_init(struct ssd1306fb_par *par)
 {
@@ -368,30 +361,35 @@ static int ssd1306fb_ssd1306_init(struct ssd1306fb_par *par)
 		U8G_ESC_END                /* end of sequence */
 	};	
 	
+	if(down_interruptible(&par->sem) != 0) return -ERESTARTSYS; 
+
 	for(c = 0; c < sizeof(cmd_init); c++){
-		ret = ssd1306fb_write_cmd(par, cmd_init[c]);
+		ret = _ssd1306fb_write_cmd(par, cmd_init[c]);
 		if (ret < 0){
 			printk("ssd1306: i2c write failed!\n"); 
-			return ret;
+			goto error; 
 		}
 		mdelay(10); 
 	}
 	
-	//schedule_work(&par->work); 
-	ssd1306fb_update_display(par); 
+	_ssd1306fb_update_display(par); 
 	
+	up(&par->sem); 
+
 	printk("ssd1306: display initialized\n"); 
 
 	return 0;
+error: 	
+	up(&par->sem); 
+	return -EFAULT; 
 }
 
-static struct ssd1306fb_ops ssd1306fb_ssd1306_ops = {
-	.init	= ssd1306fb_ssd1306_init,
-};
-
 static void ssd1306fb_deferred_io(struct fb_info *info, struct list_head *pagelist){
+	struct ssd1306fb_par *par = info->par;
 	printk("ssd1306: defio\n"); 
-	ssd1306fb_update_display(info->par); 
+	if(down_interruptible(&par->sem) != 0) return; 
+	_ssd1306fb_update_display(info->par); 
+	up(&par->sem); 
 }
 
 static int ssd1306fb_probe(struct i2c_client *client,
@@ -419,14 +417,14 @@ static int ssd1306fb_probe(struct i2c_client *client,
 	par->info = info;
 	par->client = client;
 
-	par->ops = &ssd1306fb_ssd1306_ops; 
-
 	par->width = 128; 
 	par->height = 64; 
 	par->page_offset = 1; 
 	
 	par->data16 = ssd1306fb_alloc_array((par->width * par->height) / 8, SSD1306_DATA); 
 	par->cmd1 = ssd1306fb_alloc_array(1, SSD1306_COMMAND); 
+
+	sema_init(&par->sem, 1); 
 
 	//INIT_WORK(&par->work, ssd1306fb_update_task); 
 	
@@ -467,34 +465,25 @@ static int ssd1306fb_probe(struct i2c_client *client,
 	info->fix.smem_start = __pa(info->screen_base);
 	info->fix.smem_len = vmem_size;
 
-	printk("BPP: %d\n", info->var.bits_per_pixel); 
-	
 	fb_deferred_io_init(info); 
 
 	i2c_set_clientdata(client, info);
 
-	if (par->ops->init) {
-		printk("ssd1306: initializing display\n"); 
-		ret = par->ops->init(par);
-		if (ret){
-			printk("ssd1306: failed to initialize screen!\n"); 
-			goto reset_oled_error;
-		}
+	if(ssd1306fb_ssd1306_init(par) != 0){
+		printk("ssd1306: failed to initialize screen!\n"); 
+		goto reset_oled_error; 
 	}
 
 	ret = register_framebuffer(info);
 	if (ret) {
 		dev_err(&client->dev, "Couldn't register the framebuffer\n");
-		goto panel_init_error;
+		goto reset_oled_error; 
 	}
 	
 	dev_info(&client->dev, "fb%d: %s framebuffer device registered, using %d bytes of video memory\n", info->node, info->fix.id, vmem_size);
 
 	return 0;
 
-panel_init_error:
-	if (par->ops->remove)
-		par->ops->remove(par);
 reset_oled_error:
 	fb_deferred_io_cleanup(info);
 fb_alloc_error:
@@ -513,10 +502,8 @@ static int ssd1306fb_remove(struct i2c_client *client)
 	kfree(par->cmd1); 
 
 	unregister_framebuffer(info);
-	if (par->ops->remove)
-		par->ops->remove(par);
 	fb_deferred_io_cleanup(info); 
-	__free_pages(__va(info->fix.smem_start), get_order(info->fix.smem_len));
+	free_pages(info->fix.smem_start, get_order(info->fix.smem_len));
 	framebuffer_release(info);
 
 	return 0;
